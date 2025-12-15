@@ -21,34 +21,51 @@ lib_deps =
 
 ## Quick Start Code
 
-Here is a minimal example to get your module running.
+Here is a template to get you started with your own module.
 
 ```cpp
 #include <W4RPBLE.h>
 
 W4RPBLE w4rp;
 
+// 1. Define your action handler
+void onActionTriggered(const W4RPBLE::ParamMap &params) {
+    if (params.count("value")) {
+        int val = params.at("value").toInt();
+        Serial.printf("Action triggered with value: %d\n", val);
+        // Do something real here (e.g. move text, PWM, etc)
+    }
+}
+
 void setup() {
   Serial.begin(115200);
 
-  // 1. Configure Hardware (Optional overrides)
-  // w4rp.setPins(21, 20, 8); 
-
   // 2. Configure Module Identity
-  w4rp.setBleName("My Module");
-  w4rp.setModuleFirmware("1.0.0");
+  w4rp.setBleName("My Custom Module");
+  w4rp.setModuleFirmware("0.1.0");
   
   // 3. Configure CAN Mode (Safe for vehicles)
   w4rp.setCanMode(W4RPBLE::CanMode::LISTEN_ONLY);
   
-  // 4. Initialize
+  // 4. Initialize Core
   w4rp.begin();
   
-  // 5. Register Actions
-  w4rp.registerCapability("toggle_led", [](const W4RPBLE::ParamMap &params) {
-      // Handle action
-      Serial.println("Action triggered!");
-  });
+  // 5. Register Capabilities (Actions)
+  // This tells the App what commands this module supports.
+  W4RPBLE::CapabilityMeta meta;
+  meta.id = "custom_action";
+  meta.label = "Custom Action";
+  meta.category = "output";
+  
+  W4RPBLE::CapabilityParamMeta param;
+  param.name = "value";
+  param.type = "int";
+  param.min = 0; 
+  param.max = 100;
+  meta.params.push_back(param);
+
+  // Link the metadata to your handler function
+  w4rp.registerCapability(meta, onActionTriggered);
 }
 
 void loop() {

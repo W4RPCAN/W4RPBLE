@@ -1,34 +1,61 @@
 # Capabilities
 
-Capabilities allow your device to expose "actions" that can be triggered by the rules engine.
+Capabilities are the core of the W4RPBLE automation system. They are the "actions" that your hardware receives from the W4RPBLE app or the internal Rules Engine.
+
+## How it Works
+
+1.  **Registration**: You define a Capability in your firmware (ID, Label, Parameters).
+2.  **Discovery**: On connection, the App downloads this profile.
+3.  **UI Generation**: The App automatically builds a UI for your capability (e.g., a slider for an `int`).
+4.  **Triggering**:
+    *   **Manual**: User interacts with the App UI.
+    *   **Automated**: The Rules Engine (Flow) triggers the capability when conditions are met (e.g., `RPM > 3000`).
+5.  **Execution**: The library calls your registered `handler` function with the provided parameters.
 
 ## `registerCapability`
 
-### Simple Registration
-Use this for simple actions that don't need complex parameters.
-```cpp
-w4rp.registerCapability("toggle_led", [](const W4RPBLE::ParamMap &params) {
-    digitalWrite(LED_BUILTIN, HIGH);
-});
-```
+This method links your **Metadata** (description) to your **Handler** (code).
 
-### Full Metadata Registration
-Use this to tell the mobile app exactly what parameters your capability expects.
+### 1. Define Metadata
+This tells the W4RP system *what* your module can do.
 
 ```cpp
 W4RPBLE::CapabilityMeta meta;
-meta.id = "exhaust_flap";
-meta.label = "Exhaust Flap";
-meta.category = "output";
+meta.id = "servo_control";          // Unique ID used in JSON rules
+meta.label = "Servo Position";      // Display Name in App
+meta.category = "output";           // 'output', 'debug', etc.
 
+// Define parameters (inputs for your action)
 W4RPBLE::CapabilityParamMeta param;
-param.name = "amount";
+param.name = "angle";
 param.type = "int";
 param.min = 0;
-param.max = 100;
+param.max = 180;
 meta.params.push_back(param);
+```
 
-w4rp.registerCapability(meta, onExhaustFlap);
+### 2. Define Handler
+This function is called whenever the action is triggered.
+
+```cpp
+void onServoControl(const W4RPBLE::ParamMap &params) {
+    // 1. Extract parameter
+    if (params.count("angle") == 0) return;
+    
+    int angle = params.at("angle").toInt();
+    
+    // 2. Execute Hardware Action
+    myServo.write(angle);
+    
+    LOG_BLE("Servo moved to %d", angle);
+}
+```
+
+### 3. Register
+Link them together in `setup()`.
+
+```cpp
+w4rp.registerCapability(meta, onServoControl);
 ```
 
 ## Types

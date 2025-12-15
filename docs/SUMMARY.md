@@ -9,5 +9,6 @@
   * [Capabilities](api-reference/capabilities.md)
   * [NVS Storage](api-reference/nvs.md)
 * [Advanced Usage](advanced/README.md)
+  * [Rules Engine Logic](advanced/rules-engine.md)
   * [CAN Bus Modes](advanced/can-modes.md)
   * [BLE Protocol](advanced/ble-protocol.md)
