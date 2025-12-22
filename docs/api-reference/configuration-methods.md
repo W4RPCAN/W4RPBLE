@@ -1,7 +1,7 @@
 # Configuration Methods
 
 These methods allow you to configure the module before initialization.
-> ⚠️ **Important:** All configuration methods must be called **before** `w4rp.begin()`.
+> **Important:** All configuration methods must be called **before** `w4rp.begin()`.
 
 ## Module Identity
 
@@ -56,4 +56,4 @@ Set the CAN driver operating mode.
 ```cpp
 w4rp.setCanMode(W4RPBLE::CanMode::LISTEN_ONLY);
 ```
-See [CAN integration](../advanced/can-modes.md) for more details.
+See [CAN Filtering](../advanced/can-filtering.md) for more details.

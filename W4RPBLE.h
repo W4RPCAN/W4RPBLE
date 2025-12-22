@@ -226,10 +226,10 @@ public:
                           CapabilityHandler handler);
   /// @}
 
-private:
-  struct ImplState;
-  ImplState *impl_;
+  struct ImplState; // Forward declaration
+  ImplState *impl_; // Pointer to implementation
 
+private:
   void deriveModuleId();
   void initBle();
   void initCan();
@@ -241,10 +241,11 @@ private:
   void sendStatusUpdate();
   void blinkLed(uint8_t times, uint16_t ms);
 
-  void verifyAdvertisingActive();
-  bool restartAdvertising();
-  void forceRestartAdvertising();
-  void deepResetBle();
-  void checkBleHealth();
   void sendDebugUpdates();
+
+  void pauseOperations();
+  void resumeOperations();
+
+  static void otaWorkerTaskStatic(void *pvParameters);
+  void otaWorkerTask();
 };

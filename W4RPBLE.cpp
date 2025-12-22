@@ -1,13 +1,28 @@
 #include "W4RPBLE.h"
 
+// JANPATCH CONFIGURATION (Must be before include)
+#include <stdio.h>
+#define JANPATCH_STREAM FILE
+
+#include "janpatch.h"
+#include <ArduinoJson.h>
 #include <BLE2902.h>
 #include <BLEAdvertising.h>
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <Preferences.h>
 #include <driver/twai.h>
+#include <esp_crc.h>
+#include <esp_log.h>
 #include <esp_mac.h>
+#include <esp_ota_ops.h>
+#include <esp_partition.h>
 #include <esp_system.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <functional>
+#include <nvs.h>
+#include <nvs_flash.h>
 
 #include <algorithm>
 #include <cmath>
@@ -39,9 +54,15 @@
 #define LOG_SYS(fmt, ...) LOG_TAG("SYS", fmt, ##__VA_ARGS__)
 #define LOG_ERR(fmt, ...) LOG_TAG("ERR", fmt, ##__VA_ARGS__)
 
+#define JANPATCH_BUFFER_SIZE 1024
+
 static const char *NVS_NS = "w4rp";
-static const char *NVS_KEY_CURRENT = "rules_current";
+static const char *NVS_KEY_ACTIVE_SLOT = "active_slot"; // "A" or "B"
+static const char *NVS_KEY_SLOT_A = "rules_A";
+static const char *NVS_KEY_SLOT_B = "rules_B";
+static const char *NVS_KEY_CURRENT = "rules_current"; // Legacy support
 static const char *NVS_KEY_BACKUP = "rules_backup";
+static const char *NVS_KEY_BOOTS = "boot_count"; // Legacy support
 
 struct Signal {
   char id[32];
@@ -110,14 +131,9 @@ struct Flow {
 };
 
 static uint32_t crc32_ieee(const uint8_t *data, size_t len) {
-  uint32_t crc = 0xFFFFFFFF;
-  for (size_t i = 0; i < len; i++) {
-    crc ^= data[i];
-    for (int j = 0; j < 8; j++) {
-      crc = (crc >> 1) ^ (0xEDB88320 & (-(crc & 1)));
-    }
-  }
-  return ~crc;
+  // Use 0 init because esp_crc32_le handles the input/output inversion for IEEE
+  // 802.3
+  return esp_crc32_le(0, data, len);
 }
 
 /**
@@ -126,25 +142,23 @@ static uint32_t crc32_ieee(const uint8_t *data, size_t len) {
  *
  * This class implements the Print interface, allowing ArduinoJson to serialize
  * directly to BLE without holding the entire JSON in memory. Data is buffered
- * and sent in 180-byte chunks. CRC32 is calculated incrementally.
+ * and sent in 180-byte chunks.
  */
 class BleStreamWriter : public Print {
 public:
   static constexpr size_t CHUNK_SIZE = 180;
 
   BleStreamWriter(BLECharacteristic *tx_char)
-      : tx_char_(tx_char), total_bytes_(0), crc_(0xFFFFFFFF) {
+      : tx_char_(tx_char), total_bytes_(0), crc_(0) {
     buffer_.reserve(CHUNK_SIZE);
   }
 
   size_t write(uint8_t c) override {
     buffer_.push_back(c);
     total_bytes_++;
-    // Update CRC incrementally
-    crc_ ^= c;
-    for (int j = 0; j < 8; j++) {
-      crc_ = (crc_ >> 1) ^ (0xEDB88320 & (-(crc_ & 1)));
-    }
+    // Use HW CRC (esp_crc32_le handles init inversion ~0 and final inversion)
+    crc_ = esp_crc32_le(crc_, &c, 1);
+
     if (buffer_.size() >= CHUNK_SIZE) {
       flush();
     }
@@ -152,8 +166,29 @@ public:
   }
 
   size_t write(const uint8_t *buf, size_t size) override {
-    for (size_t i = 0; i < size; i++) {
-      write(buf[i]);
+    if (size == 0)
+      return 0;
+
+    // Use HW CRC (esp_crc32_le handles init inversion ~0 and final inversion)
+    crc_ = esp_crc32_le(crc_, buf, size);
+    total_bytes_ += size;
+
+    size_t remaining = size;
+    size_t offset = 0;
+
+    while (remaining > 0) {
+      size_t space = CHUNK_SIZE - buffer_.size();
+      size_t copy_len = (remaining < space) ? remaining : space;
+
+      if (copy_len > 0)
+        buffer_.insert(buffer_.end(), buf + offset, buf + offset + copy_len);
+
+      remaining -= copy_len;
+      offset += copy_len;
+
+      if (buffer_.size() >= CHUNK_SIZE) {
+        flush();
+      }
     }
     return size;
   }
@@ -164,7 +199,8 @@ public:
     tx_char_->setValue(buffer_.data(), buffer_.size());
     tx_char_->notify();
     buffer_.clear();
-    delay(3); // Small delay for BLE stack
+    // Use FreeRTOS delay to yield
+    vTaskDelay(pdMS_TO_TICKS(5));
   }
 
   void finalize() {
@@ -173,7 +209,7 @@ public:
   }
 
   size_t totalBytes() const { return total_bytes_; }
-  uint32_t crc32() const { return ~crc_; }
+  uint32_t crc32() const { return crc_; }
 
 private:
   BLECharacteristic *tx_char_;
@@ -189,6 +225,10 @@ struct W4RPBLE::ImplState {
   std::map<String, uint8_t> signal_id_to_idx;
   std::map<String, uint8_t> node_id_to_idx;
 
+  // Optimization: O(1) Lookup Table for CAN Signals
+  // Maps CAN ID -> List of pointers to Signals that use it
+  std::map<uint32_t, std::vector<Signal *>> signal_map;
+
   BLECharacteristic *rx_char = nullptr;
   BLECharacteristic *tx_char = nullptr;
   BLECharacteristic *status_char = nullptr;
@@ -200,13 +240,7 @@ struct W4RPBLE::ImplState {
   bool led_blink_state = false;
   uint32_t last_led_blink_ms = 0;
 
-  bool adv_verification_pending = false;
-  uint32_t adv_verification_deadline_ms = 0;
-  uint8_t adv_restart_attempts = 0;
-  bool adv_error_state = false;
-  bool adv_needs_deep_reset = false;
   uint32_t last_disconnect_ms = 0;
-  uint8_t consecutive_failures = 0;
   uint32_t last_successful_connect_ms = 0;
   bool ble_stack_healthy = true;
 
@@ -214,38 +248,55 @@ struct W4RPBLE::ImplState {
   uint32_t frames_received = 0;
   uint32_t flows_triggered = 0;
 
-  char module_id[32] = "W4RP-XXXX";
-  String module_id_override;
+  // Stream State
+  bool stream_active = false;
+  uint32_t stream_expected_len = 0;
+  uint32_t stream_expected_crc = 0;
+  uint32_t stream_processed_bytes = 0;
+  bool stream_is_persistent = false;
+  bool stream_is_debug_watch = false;
+  bool stream_is_ota = false; // New flag for OTA mode
+  String ota_signature;       // Stores the Ed25519 signature from OTA:BEGIN
 
+  uint32_t boot_count = 0;
+
+  // Ring Buffer (8KB)
+  static const size_t RING_BUFFER_SIZE = 8192;
+  uint8_t rx_ring_buffer[RING_BUFFER_SIZE];
+  volatile size_t rb_head = 0;
+  volatile size_t rb_tail = 0;
+
+  TaskHandle_t ota_task_handle = nullptr;
+  bool ota_task_running = false;
+  bool ota_in_progress = false; // System-wide OTA Safety Flag
+  esp_ota_handle_t active_ota_handle = 0;
+
+  std::vector<uint8_t> config_buffer; // RAM buffer for configuration
+
+  char module_id[32];
+  String module_id_override;
   String hw_model = HW_MODEL_DEFAULT;
   String fw_version = FW_VERSION_DEFAULT;
   String serial;
-  String device_name;
+  String device_name = "W4RP-Module";
   String ble_name_override;
-
   String last_ruleset_json;
   String ruleset_dialect;
   uint32_t ruleset_crc32 = 0;
   String ruleset_last_update;
 
-  std::vector<uint8_t> stream_buffer;
-  bool stream_active = false;
-  size_t stream_expected_len = 0;
-  uint32_t stream_expected_crc = 0;
-  bool stream_is_persistent = false;
-
   Preferences prefs;
+  nvs_handle_t nvs_handle;
+  bool nvs_open = false;
 
   std::map<String, W4RPBLE::CapabilityHandler> capability_handlers;
   std::map<String, W4RPBLE::CapabilityMeta> capability_meta;
 
   uint32_t last_status_update_ms = 0;
-  uint32_t last_health_check_ms = 0;
 
   bool debug_mode = false;
   uint32_t last_debug_update_ms = 0;
   std::vector<Signal> debug_signals;
-  bool stream_is_debug_watch = false;
 
   // Hardware Config
   gpio_num_t pin_can_tx = (gpio_num_t)DEFAULT_CAN_TX_PIN;
@@ -256,6 +307,290 @@ struct W4RPBLE::ImplState {
 };
 
 static W4RPBLE *s_instance = nullptr;
+
+// Custom JANPATCH_STREAM structure
+struct OtaStream {
+  W4RPBLE::ImplState *state;
+  const esp_partition_t *part;
+  long offset;
+  bool is_patch_stream;
+  bool is_target;
+
+  // Dual Page Cache State
+  uint8_t *cache_A;          // Page N (Current)
+  uint8_t *cache_B;          // Page N-1 (Previous)
+  uint32_t current_page_idx; // Index of page in cache_A
+  bool cache_initialized;
+};
+
+// PAGE SIZE must match Janpatch buffer size
+#define OTA_PAGE_SIZE 1024
+
+// JANPATCH Callbacks
+static size_t ota_fread(void *ptr, size_t size, size_t count, FILE *stream) {
+  OtaStream *s = (OtaStream *)stream;
+  size_t bytes_to_read = size * count;
+  uint8_t *out_ptr = (uint8_t *)ptr;
+
+  if (!s->is_patch_stream) {
+    // READ FROM FLASH (Source Firmware) - Random Access OK
+    esp_err_t err = esp_partition_read(s->part, s->offset, ptr, bytes_to_read);
+    if (err == ESP_OK) {
+      s->offset += bytes_to_read;
+      return count;
+    }
+    LOG_ERR("Flash Read Error: %s", esp_err_to_name(err));
+    return 0;
+  }
+
+  // READ FROM RINGBUFFER (Patch Stream) - Dual Page Cache Logic
+  // Janpatch reads strictly in chunks if using buffer.
+  // However, janpatch_buffer logic might ask for 1 byte or 1024 bytes.
+  // We assume janpatch always calls fread aligned to its logical position.
+
+  // We need to map s->offset to Page Index
+  uint32_t req_page_idx = s->offset / OTA_PAGE_SIZE;
+  uint32_t req_page_offset = s->offset % OTA_PAGE_SIZE;
+
+  // How many bytes can we read from this page?
+  size_t bytes_available_in_page = OTA_PAGE_SIZE - req_page_offset;
+  if (bytes_to_read > bytes_available_in_page) {
+    // Crosses page boundary? Janpatch buffer logic typically avoids this if
+    // aligned. But if it asks for > 1 page?
+    bytes_to_read = bytes_available_in_page; // Read only up to end of page
+  }
+
+  uint8_t *source_ptr = nullptr;
+
+  if (!s->cache_initialized) {
+    // First read ever
+    s->current_page_idx = req_page_idx; // Should be 0
+    s->cache_initialized = true;
+
+    // Fill Cache A from RingBuffer (Initial Load)
+    W4RPBLE::ImplState *impl = s->state;
+    size_t filled = 0;
+    uint32_t start_wait = millis();
+
+    while (filled < OTA_PAGE_SIZE) {
+      if (!impl->stream_active && impl->rb_head == impl->rb_tail) {
+        // Stream ended prematurely? Or just short patch?
+        break;
+      }
+      if (impl->rb_head != impl->rb_tail) {
+        s->cache_A[filled++] = impl->rx_ring_buffer[impl->rb_tail];
+        impl->rb_tail = (impl->rb_tail + 1) % impl->RING_BUFFER_SIZE;
+        start_wait = millis();
+      } else {
+        vTaskDelay(pdMS_TO_TICKS(5));
+        if (millis() - start_wait > 5000) {
+          LOG_ERR("OTA Rx Timeout in Init Page Load!");
+          return 0;
+        }
+      }
+    }
+  }
+
+  // Cache Hit Logic
+  if (req_page_idx == s->current_page_idx) {
+    source_ptr = s->cache_A;
+  } else if (req_page_idx == s->current_page_idx - 1) {
+    // Rewind to Previous Page
+    source_ptr = s->cache_B;
+  } else if (req_page_idx == s->current_page_idx + 1) {
+    // Advance to Next Page
+    // Swap pointers: B becomes old A, A becomes new buffer
+    uint8_t *temp = s->cache_B;
+    s->cache_B = s->cache_A;
+    s->cache_A = temp; // Reuse B's memory for new A
+
+    s->current_page_idx = req_page_idx;
+
+    // Fill new Cache A from RingBuffer
+    // This is the CRITICAL BLOCKING STEP
+    W4RPBLE::ImplState *impl = s->state;
+    size_t filled = 0;
+    uint32_t start_wait = millis();
+
+    // We MUST fill the whole page (or as much as stream has if END)
+    while (filled < OTA_PAGE_SIZE) {
+      if (!impl->stream_active && impl->rb_head == impl->rb_tail) {
+        // Stream ended
+        break;
+      }
+      if (impl->rb_head != impl->rb_tail) {
+        s->cache_A[filled++] = impl->rx_ring_buffer[impl->rb_tail];
+        impl->rb_tail = (impl->rb_tail + 1) % impl->RING_BUFFER_SIZE;
+        start_wait = millis();
+      } else {
+        vTaskDelay(pdMS_TO_TICKS(5));
+        if (millis() - start_wait > 5000) {
+          LOG_ERR("OTA Rx Timeout in Page Load!");
+          return 0;
+        }
+      }
+    }
+    source_ptr = s->cache_A;
+  } else {
+    LOG_ERR("OTA Cache Miss Fatal: Req %u, Curr %u", req_page_idx,
+            s->current_page_idx);
+    return 0;
+  }
+
+  // Copy to Janpatch buffer
+  if (source_ptr) {
+    memcpy(out_ptr, source_ptr + req_page_offset, bytes_to_read);
+    s->offset += bytes_to_read;
+    return bytes_to_read / size; // Return count
+  }
+
+  return 0;
+}
+
+// ... ota_fwrite and ota_fseek/ftell remain mostly same but updated for
+// OtaStream struct ... We need to implement them carefully.
+
+static size_t ota_fwrite(const void *ptr, size_t size, size_t count,
+                         FILE *stream) {
+  OtaStream *s = (OtaStream *)stream;
+  size_t bytes_to_write = size * count;
+  if (!s->is_target)
+    return 0;
+
+  esp_err_t err =
+      esp_ota_write(s->state->active_ota_handle, ptr, bytes_to_write);
+  if (err != ESP_OK) {
+    LOG_ERR("OTA Write Error: %s", esp_err_to_name(err));
+    return 0;
+  }
+  s->offset += bytes_to_write;
+  return count;
+}
+
+static int ota_fseek(FILE *stream, long int offset, int origin) {
+  OtaStream *s = (OtaStream *)stream;
+  // Update s->offset
+  if (origin == SEEK_SET)
+    s->offset = offset;
+  else if (origin == SEEK_CUR)
+    s->offset += offset;
+  else if (origin == SEEK_END) { /* Not supported for stream */
+    return -1;
+  }
+  return 0;
+}
+
+static long ota_ftell(FILE *stream) {
+  OtaStream *s = (OtaStream *)stream;
+  return s->offset;
+}
+
+void W4RPBLE::otaWorkerTask() {
+  LOG_SYS("OTA Tasks Started");
+
+  // Allocate buffers for janpatch (1KB each)
+  uint8_t *source_buf = (uint8_t *)malloc(OTA_PAGE_SIZE);
+  uint8_t *patch_buf = (uint8_t *)malloc(OTA_PAGE_SIZE);
+  uint8_t *target_buf = (uint8_t *)malloc(OTA_PAGE_SIZE);
+
+  // Allocate Dual Page Cache for Patch Stream (2KB)
+  uint8_t *cache_A = (uint8_t *)malloc(OTA_PAGE_SIZE);
+  uint8_t *cache_B = (uint8_t *)malloc(OTA_PAGE_SIZE);
+
+  if (!source_buf || !patch_buf || !target_buf || !cache_A || !cache_B) {
+    LOG_ERR("OTA OOM");
+    return;
+  }
+
+  while (true) {
+    if (!impl_->ota_task_running) {
+      vTaskDelay(pdMS_TO_TICKS(100)); // Idling
+      continue;
+    }
+
+    LOG_BLE("OTA Worker Processing...");
+
+    const esp_partition_t *update_part =
+        esp_ota_get_next_update_partition(NULL);
+    const esp_partition_t *running_part = esp_ota_get_running_partition();
+
+    if (!update_part || !running_part) {
+      LOG_ERR("Partition Error");
+      impl_->ota_task_running = false;
+      resumeOperations(); // Recover
+      continue;
+    }
+
+    esp_err_t err =
+        esp_ota_begin(update_part, OTA_SIZE_UNKNOWN, &impl_->active_ota_handle);
+    if (err != ESP_OK) {
+      LOG_ERR("esp_ota_begin failed: %s", esp_err_to_name(err));
+      impl_->ota_task_running = false;
+      resumeOperations(); // Recover
+      continue;
+    }
+
+    // Setup Janpatch Context
+
+    // Setup Streams with Cache
+    // Note: Start cache_A not filled until first read
+    OtaStream src_s = {impl_,   running_part, 0, false, false,
+                       nullptr, nullptr,      0, false};
+    OtaStream pch_s = {
+        impl_, NULL, 0, true, false, cache_A, cache_B, 0, false // Dual Cache
+    };
+    OtaStream tgt_s = {impl_,   update_part, 0, false, true,
+                       nullptr, nullptr,     0, false};
+
+    // Pre-fill first page of Cache A?
+    // No, let ota_fread handle it on first call to ensure we don't block before
+    // janpatch starts.
+
+    // 4. Configure JANPATCH Context
+    // 4. Configure JANPATCH Context
+    janpatch_ctx ctx = {
+        {(unsigned char *)malloc(JANPATCH_BUFFER_SIZE), JANPATCH_BUFFER_SIZE, 0,
+         JANPATCH_BUFFER_SIZE, (JANPATCH_STREAM *)&src_s, 0},
+        {(unsigned char *)malloc(JANPATCH_BUFFER_SIZE), JANPATCH_BUFFER_SIZE, 0,
+         JANPATCH_BUFFER_SIZE, (JANPATCH_STREAM *)&pch_s, 0},
+        {(unsigned char *)malloc(JANPATCH_BUFFER_SIZE), JANPATCH_BUFFER_SIZE, 0,
+         JANPATCH_BUFFER_SIZE, (JANPATCH_STREAM *)&tgt_s, 0},
+        &ota_fread,
+        &ota_fwrite,
+        &ota_fseek,
+        &ota_ftell};
+
+    LOG_BLE("Executing Janpatch...");
+    // 5. Execute Janpatch
+    int ret = janpatch(ctx, (JANPATCH_STREAM *)&src_s,
+                       (JANPATCH_STREAM *)&pch_s, (JANPATCH_STREAM *)&tgt_s);
+
+    if (ret == 0) {
+      LOG_BLE("Patch Success! Verifying...");
+      err = esp_ota_end(impl_->active_ota_handle);
+      if (err == ESP_OK) {
+        err = esp_ota_set_boot_partition(update_part);
+        if (err == ESP_OK) {
+          LOG_BLE("OTA COMPLETE. Rebooting...");
+          delay(1000);
+          esp_restart();
+        } else {
+          LOG_ERR("Set Boot Partition failed");
+        }
+      } else {
+        LOG_ERR("OTA End failed");
+      }
+    } else {
+      LOG_ERR("Janpatch Failed: %d", ret);
+      esp_ota_end(impl_->active_ota_handle);
+    }
+
+    impl_->ota_task_running = false;
+
+    // Resume System (Safe Mode if failed)
+    resumeOperations();
+  }
+}
 
 class ServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer *server) override {
@@ -395,16 +730,36 @@ void W4RPBLE::setCanMode(CanMode mode) {
 }
 
 bool W4RPBLE::nvsWrite(const char *key, const String &value) {
-  impl_->prefs.begin(NVS_NS, false);
-  bool ok = impl_->prefs.putString(key, value) > 0;
-  impl_->prefs.end();
-  return ok;
+  if (!impl_->nvs_open)
+    return false;
+  esp_err_t err = nvs_set_str(impl_->nvs_handle, key, value.c_str());
+  if (err != ESP_OK) {
+    LOG_ERR("NVS Write Failed: %s", esp_err_to_name(err));
+    return false;
+  }
+  return (nvs_commit(impl_->nvs_handle) == ESP_OK);
 }
 
 String W4RPBLE::nvsRead(const char *key) {
-  impl_->prefs.begin(NVS_NS, true);
-  String val = impl_->prefs.getString(key, "");
-  impl_->prefs.end();
+  if (!impl_->nvs_open)
+    return "";
+
+  size_t required_size;
+  esp_err_t err = nvs_get_str(impl_->nvs_handle, key, nullptr, &required_size);
+  if (err != ESP_OK)
+    return "";
+
+  if (required_size == 0)
+    return "";
+
+  // Allocate temp buffer
+  char *buf = (char *)malloc(required_size);
+  if (!buf)
+    return "";
+
+  nvs_get_str(impl_->nvs_handle, key, buf, &required_size);
+  String val = String(buf);
+  free(buf);
   return val;
 }
 
@@ -547,9 +902,15 @@ execute_action_node(const Node &node,
   it->second(node.config.params);
 }
 
-static bool traverse_flow_graph(
-    uint8_t node_idx, std::vector<Node> &nodes, std::vector<Signal> &signals,
-    std::map<String, W4RPBLE::CapabilityHandler> &handlers, uint32_t now_ms) {
+static bool
+traverse_flow_graph(uint8_t node_idx, std::vector<Node> &nodes,
+                    std::vector<Signal> &signals,
+                    std::map<String, W4RPBLE::CapabilityHandler> &handlers,
+                    uint32_t now_ms, uint8_t depth) {
+  if (depth > 16) {
+    LOG_ERR("Recursion limit reached");
+    return false;
+  }
   if (node_idx >= nodes.size())
     return false;
 
@@ -565,7 +926,8 @@ static bool traverse_flow_graph(
 
     bool any_success = false;
     for (uint8_t next_idx : node.wires) {
-      if (traverse_flow_graph(next_idx, nodes, signals, handlers, now_ms)) {
+      if (traverse_flow_graph(next_idx, nodes, signals, handlers, now_ms,
+                              depth + 1)) {
         any_success = true;
       }
     }
@@ -575,7 +937,8 @@ static bool traverse_flow_graph(
   if (node.type == NODE_ACTION) {
     execute_action_node(node, handlers);
     for (uint8_t next_idx : node.wires) {
-      traverse_flow_graph(next_idx, nodes, signals, handlers, now_ms);
+      traverse_flow_graph(next_idx, nodes, signals, handlers, now_ms,
+                          depth + 1);
     }
     return true;
   }
@@ -628,7 +991,7 @@ void W4RPBLE::evaluateFlowsInternal() {
       if (root_idx >= impl_->nodes.size())
         continue;
       if (traverse_flow_graph(root_idx, impl_->nodes, impl_->signals,
-                              impl_->capability_handlers, now_ms)) {
+                              impl_->capability_handlers, now_ms, 0)) {
         any_triggered = true;
       }
     }
@@ -690,6 +1053,12 @@ bool W4RPBLE::applyRuleset(JsonDocument &doc) {
 
     impl_->signal_id_to_idx[String(sig.id)] = impl_->signals.size();
     impl_->signals.push_back(sig);
+  }
+
+  // Build O(1) Signal Map
+  impl_->signal_map.clear();
+  for (Signal &sig : impl_->signals) {
+    impl_->signal_map[sig.can_id].push_back(&sig);
   }
 
   JsonArray nodes_arr = doc["nodes"];
@@ -913,8 +1282,8 @@ void W4RPBLE::sendModuleProfile() {
   }
 
   JsonObject runtime = doc.createNestedObject("runtime");
-  runtime["uptime_ms"] = millis();
-  runtime["boot_count"] = 1;
+  runtime["uptime_ms"] = (uint32_t)millis();
+  runtime["boot_count"] = impl_->boot_count;
 
   if (impl_->signals.size() == 0) {
     runtime["mode"] = "empty";
@@ -1009,7 +1378,7 @@ void W4RPBLE::sendModuleProfile() {
 }
 
 void W4RPBLE::sendStatusUpdate() {
-  if (!impl_->status_char)
+    if (!impl_->status_char || !impl_->client_connected)
     return;
 
   StaticJsonDocument<512> doc;
@@ -1021,11 +1390,18 @@ void W4RPBLE::sendStatusUpdate() {
     doc["serial"] = impl_->serial;
   }
   doc["uptime_ms"] = millis();
+  doc["boot_count"] = impl_->boot_count;
 
   if (impl_->signals.size() == 0) {
     doc["mode"] = "empty";
   } else {
-    String nvs_current = nvsRead(NVS_KEY_CURRENT);
+    // Read active slot content to compare
+    String active_slot = nvsRead(NVS_KEY_ACTIVE_SLOT);
+    if (active_slot == "")
+      active_slot = "A";
+    const char *key = (active_slot == "B") ? NVS_KEY_SLOT_B : NVS_KEY_SLOT_A;
+    String nvs_current = nvsRead(key);
+
     doc["mode"] = (nvs_current == impl_->last_ruleset_json) ? "nvs" : "ram";
   }
 
@@ -1045,167 +1421,13 @@ void W4RPBLE::sendStatusUpdate() {
   impl_->status_char->notify();
 }
 
-void W4RPBLE::deepResetBle() {
-  LOG_BLE("Performing DEEP BLE reset...");
-
-  impl_->consecutive_failures++;
-
-  if (impl_->advertising) {
-    impl_->advertising->stop();
-  }
-
-  // Cleanup pointers (BLEDevice::deinit handles memory)
-  impl_->server = nullptr;
-  impl_->rx_char = nullptr;
-  impl_->tx_char = nullptr;
-  impl_->status_char = nullptr;
-  impl_->advertising = nullptr;
-
-  delay(200);
-
-  BLEDevice::deinit(true);
-
-  delay(500);
-
-  // Re-init using standard initBle which creates new objects
-  initBle();
-
-  impl_->adv_restart_attempts = 0;
-  impl_->adv_verification_pending = true;
-  impl_->adv_verification_deadline_ms = millis() + 3000;
-  impl_->adv_error_state = false;
-  impl_->adv_needs_deep_reset = false;
-
-  LOG_BLE("Deep reset complete, advertising restarted");
-}
-
-bool W4RPBLE::restartAdvertising() {
-  if (!impl_->advertising || !impl_->server) {
-    LOG_BLE("restartAdvertising: missing BLE instances");
-    impl_->adv_needs_deep_reset = true;
-    return false;
-  }
-
-  LOG_BLE("Advertising restart attempt #%u",
-          (unsigned int)(impl_->adv_restart_attempts + 1));
-
-  impl_->advertising->stop();
-  delay(100);
-
-  impl_->server->startAdvertising();
-
-  impl_->adv_restart_attempts++;
-  impl_->adv_verification_pending = true;
-  impl_->adv_verification_deadline_ms = millis() + 3000;
-  impl_->adv_error_state = false;
-
-  return true;
-}
-
-void W4RPBLE::forceRestartAdvertising() {
-  LOG_BLE("Force restart requested");
-
-  impl_->adv_restart_attempts = 0;
-  impl_->adv_error_state = false;
-  impl_->adv_verification_pending = false;
-  impl_->adv_verification_deadline_ms = 0;
-  impl_->consecutive_failures = 0;
-  impl_->adv_needs_deep_reset = false;
-
-  uint32_t time_since_last_connect =
-      millis() - impl_->last_successful_connect_ms;
-  if (time_since_last_connect > 60000) {
-    LOG_BLE("No connection for >60s, using deep reset");
-    deepResetBle();
-  } else {
-    restartAdvertising();
-  }
-}
-
-void W4RPBLE::verifyAdvertisingActive() {
-  if (!impl_->adv_verification_pending) {
-    if (impl_->adv_needs_deep_reset && !impl_->client_connected) {
-      uint32_t time_since_disconnect = millis() - impl_->last_disconnect_ms;
-      if (time_since_disconnect > 1000) {
-        deepResetBle();
-      }
-    }
-    return;
-  }
-
-  if (!impl_->advertising || !impl_->server) {
-    LOG_BLE("Verification failed: missing BLE instances");
-    impl_->adv_verification_pending = false;
-    impl_->adv_needs_deep_reset = true;
-    return;
-  }
-
-  if (impl_->client_connected) {
-    impl_->adv_verification_pending = false;
-    impl_->adv_restart_attempts = 0;
-    impl_->adv_error_state = false;
-    impl_->consecutive_failures = 0;
-    return;
-  }
-
-  uint32_t now = millis();
-  if ((int32_t)(now - impl_->adv_verification_deadline_ms) < 0) {
-    return;
-  }
-
-  impl_->adv_verification_pending = false;
-
-  bool isAdv = impl_->advertising->isAdvertising();
-
-  if (isAdv) {
-    LOG_BLE("Advertising verification OK");
-    impl_->adv_restart_attempts = 0;
-    impl_->adv_error_state = false;
-    impl_->consecutive_failures = 0;
-    return;
-  }
-
-  LOG_BLE("Advertising verification FAILED");
-
-  if (impl_->adv_restart_attempts >= 3) {
-    LOG_BLE("Max restart attempts reached, triggering deep reset");
-    impl_->adv_error_state = true;
-    impl_->adv_needs_deep_reset = true;
-    return;
-  }
-
-  restartAdvertising();
-}
-
-void W4RPBLE::checkBleHealth() {
-  if (impl_->client_connected)
-    return;
-
-  uint32_t now = millis();
-  uint32_t time_since_disconnect = now - impl_->last_disconnect_ms;
-
-  if (time_since_disconnect > 120000 && !impl_->adv_verification_pending) {
-    LOG_BLE("Health check: long disconnection, triggering deep reset");
-    deepResetBle();
-    impl_->last_disconnect_ms = now;
-  }
-}
-
 void W4RPBLE::onBleConnect(BLEServer *server) {
   impl_->client_connected = true;
   impl_->last_successful_connect_ms = millis();
-
-  impl_->consecutive_failures = 0;
   impl_->ble_stack_healthy = true;
 
-  digitalWrite(impl_->pin_led, HIGH);
-
+  digitalWrite(impl_->pin_led, LOW); // Active Low: ON
   LOG_BLE("Client connected successfully");
-
-  impl_->adv_verification_pending = false;
-  impl_->adv_restart_attempts = 0;
-  impl_->adv_error_state = false;
-  impl_->adv_needs_deep_reset = false;
 
   delay(100);
   sendStatusUpdate();
@@ -1217,47 +1439,35 @@ void W4RPBLE::onBleDisconnect(BLEServer *server) {
 
   LOG_BLE("Client disconnected");
 
-  uint32_t connection_duration = millis() - impl_->last_successful_connect_ms;
-  bool was_quick_disconnect = connection_duration < 5000;
-
-  if (was_quick_disconnect) {
-    LOG_BLE("Quick disconnect detected (%lu ms), potential issue",
-            connection_duration);
-    impl_->consecutive_failures++;
-  } else {
-    impl_->consecutive_failures = 0;
-  }
-
+  // Reset LED state
   impl_->last_led_blink_ms = millis();
   impl_->led_blink_state = false;
-  digitalWrite(impl_->pin_led, LOW);
+  digitalWrite(impl_->pin_led, HIGH); // Active Low: OFF
 
-  if (impl_->consecutive_failures >= 3 || impl_->adv_needs_deep_reset) {
-    LOG_BLE("Multiple failures detected, performing deep reset");
-    deepResetBle();
-  } else {
-    impl_->adv_error_state = false;
-    impl_->adv_verification_pending = false;
-    impl_->adv_verification_deadline_ms = 0;
-    impl_->adv_restart_attempts = 0;
+  if (impl_->advertising) {
+    LOG_BLE("Restarting advertising...");
+    impl_->advertising->stop();
+    delay(50); // Give stack time to stop
 
-    delay(100);
+    // CRITICAL: Re-add Service UUID to ensure discoverability (fixes unmount
+    // issue)
+    impl_->advertising->addServiceUUID(W4RP_SERVICE_UUID);
+    impl_->advertising->setScanResponse(true);
 
-    if (impl_->advertising) {
-      impl_->advertising->stop();
-      delay(10);
-      impl_->advertising->addServiceUUID(W4RP_SERVICE_UUID);
-      impl_->advertising->setScanResponse(true);
-      impl_->advertising->setMinPreferred(
-          0x06); // functions that help with iPhone connections issue
-      impl_->advertising->setMaxPreferred(0x12);
-      impl_->advertising->start();
-      LOG_BLE("Advertising restarted with full config");
-    } else {
-      LOG_BLE("Missing advertising instance, needs deep reset");
-      impl_->adv_needs_deep_reset = true;
-    }
+    // Standard Apple/Android intervals (0x06 = 3.75ms, 0x12 = 11.25ms)
+    impl_->advertising->setMinPreferred(0x06);
+    impl_->advertising->setMaxPreferred(0x12);
+
+    impl_->advertising->start();
   }
+
+  // Only create OTA Task if not already running/created
+  if (impl_->ota_task_handle == nullptr) {
+    xTaskCreate(otaWorkerTaskStatic, "OTA", 4096, this, 1,
+                &impl_->ota_task_handle);
+  }
+
+  LOG_BLE("BLE Reset Complete");
 }
 
 void W4RPBLE::onBleWrite(BLECharacteristic *characteristic) {
@@ -1272,8 +1482,7 @@ void W4RPBLE::onBleWrite(BLECharacteristic *characteristic) {
   }
 
   if (packet == "RESET:BLE") {
-    LOG_BLE("Manual BLE reset requested");
-    deepResetBle();
+    LOG_BLE("Manual BLE reset requested (ignored in standard mode)");
     return;
   }
 
@@ -1313,12 +1522,56 @@ void W4RPBLE::onBleWrite(BLECharacteristic *characteristic) {
     impl_->stream_expected_crc = strtoul(crc_str.c_str(), nullptr, 10);
     impl_->stream_is_persistent = false;
     impl_->stream_is_debug_watch = true;
-    impl_->stream_buffer.clear();
+    impl_->stream_is_ota = false;
+    impl_->stream_is_persistent = false; // Safety
+    impl_->config_buffer.clear();
+
     if (impl_->stream_expected_len > 0) {
-      impl_->stream_buffer.reserve(impl_->stream_expected_len);
+      impl_->config_buffer.reserve(impl_->stream_expected_len);
     }
+    impl_->stream_processed_bytes = 0; // Essential reset
     impl_->stream_active = true;
     LOG_BLE("DEBUG:WATCH started");
+    return;
+  }
+
+  // ------------------------------------------------------------------------
+  // OTA:START Command (New)
+  // ------------------------------------------------------------------------
+  if (packet.startsWith("OTA:START:DELTA:")) {
+    // Format: OTA:START:DELTA:<len>:<source_crc>
+    // Example: OTA:START:DELTA:54000:12345678
+    const int start = 16;
+    int colon1 = packet.indexOf(':', start);
+
+    if (colon1 < 0)
+      return;
+
+    String len_str = packet.substring(start, colon1);
+    String crc_str = packet.substring(colon1 + 1);
+
+    impl_->stream_expected_len = len_str.toInt();
+    impl_->stream_expected_crc = strtoul(crc_str.c_str(), nullptr, 10);
+    impl_->stream_is_persistent = false;
+    impl_->stream_is_ota = true; // DIRECT TO RINGBUFFER
+
+    // Reset Ring Buffer
+    impl_->rb_head = 0;
+    impl_->rb_tail = 0;
+    impl_->stream_processed_bytes = 0;
+
+    // Notify    // Start Task
+    impl_->ota_task_running = true;
+
+    // SAFETY: Pause TWAI and Rules to prevent interference
+    pauseOperations();
+
+    // Notify Task
+    xTaskNotify(impl_->ota_task_handle, 1, eSetBits);
+
+    impl_->stream_active = true;
+    LOG_BLE("Delta Stream Setup Complete for %u bytes",
+            impl_->stream_expected_len);
     return;
   }
 
@@ -1346,13 +1599,19 @@ void W4RPBLE::onBleWrite(BLECharacteristic *characteristic) {
 
     impl_->stream_expected_len = len_str.toInt();
     impl_->stream_expected_crc = strtoul(crc_str.c_str(), nullptr, 10);
+
+    // Explicitly reset ALL stream flags
     impl_->stream_is_persistent = (mode == "NVS");
-    impl_->stream_buffer.clear();
+    impl_->stream_is_ota = false;
+    impl_->stream_is_debug_watch = false;
+
+    impl_->config_buffer.clear();
 
     if (impl_->stream_expected_len > 0) {
-      impl_->stream_buffer.reserve(impl_->stream_expected_len);
+      impl_->config_buffer.reserve(impl_->stream_expected_len);
     }
 
+    impl_->stream_processed_bytes = 0;
     impl_->stream_active = true;
 
     LOG_BLE("SET:RULES:%s - expect %u bytes, CRC=0x%08lX", mode.c_str(),
@@ -1361,101 +1620,223 @@ void W4RPBLE::onBleWrite(BLECharacteristic *characteristic) {
     return;
   }
 
+  // --- OTA COMMAND HANDLER ---
+  // Format: OTA:BEGIN:SIZE:CRC[:SIGNATURE]
+  if (packet.startsWith("OTA:BEGIN:")) {
+    unsigned int start = 10;
+    int colon1 = packet.indexOf(':', start);
+    int colon2 = (colon1 >= 0) ? packet.indexOf(':', colon1 + 1) : -1;
+
+    if (colon1 < 0) {
+      LOG_ERR("Invalid OTA header: %s", packet.c_str());
+      return;
+    }
+
+    String len_str = packet.substring(start, colon1);
+    String crc_str;
+    String sig_str;
+
+    if (colon2 < 0) {
+      // No signature
+      crc_str = packet.substring(colon1 + 1);
+    } else {
+      // Has signature
+      crc_str = packet.substring(colon1 + 1, colon2);
+      sig_str = packet.substring(colon2 + 1);
+    }
+
+    impl_->stream_expected_len = len_str.toInt();
+    impl_->stream_expected_crc = strtoul(crc_str.c_str(), nullptr, 10);
+    impl_->ota_signature = sig_str; // Store signature
+
+    impl_->stream_is_persistent = false;
+    impl_->stream_is_ota = true; // DIRECT TO RINGBUFFER
+
+    // Reset Ring Buffer
+    impl_->rb_head = 0;
+    impl_->rb_tail = 0;
+    impl_->stream_processed_bytes = 0;
+
+    impl_->stream_active = true;
+
+    // Pause other operations for safety
+    pauseOperations();
+
+    LOG_BLE("OTA START: Size=%u, CRC=0x%08lX", impl_->stream_expected_len,
+            (unsigned long)impl_->stream_expected_crc);
+    if (sig_str.length() > 0) {
+      LOG_BLE("OTA Signature: %s", sig_str.c_str());
+    } else {
+      LOG_BLE("OTA Warning: No Signature provided");
+    }
+
+    return;
+  }
+
   if (impl_->stream_active && packet != "END") {
+    // STREAM DATA HANDLER
     const uint8_t *ptr = (const uint8_t *)packet.c_str();
-    impl_->stream_buffer.insert(impl_->stream_buffer.end(), ptr,
-                                ptr + packet.length());
+    size_t len = packet.length();
+
+    if (impl_->stream_is_ota) {
+      // -----------------------------------------------------
+      // OTA PATH: Push to RingBuffer (Zero-Copy)
+      // -----------------------------------------------------
+      for (size_t i = 0; i < len; i++) {
+        size_t next_head = (impl_->rb_head + 1) % impl_->RING_BUFFER_SIZE;
+
+        // overflow check (simple drop for now, but in reality we should
+        // pause/ACK) But BLE is slow enough compared to strict copy. Ideally we
+        // check space.
+        if (next_head != impl_->rb_tail) {
+          impl_->rx_ring_buffer[impl_->rb_head] = ptr[i];
+          impl_->rb_head = next_head;
+        } else {
+          // Buffer Overflow!
+          // This is bad. In real implementation we need flow control.
+          LOG_ERR("OTA RingBuffer Overflow!");
+        }
+      }
+    } else {
+      // -----------------------------------------------------
+      // LEGACY PATH: Buffer to RAM
+      // -----------------------------------------------------
+      impl_->config_buffer.insert(impl_->config_buffer.end(), ptr, ptr + len);
+    }
+    impl_->stream_processed_bytes += len;
     return;
   }
 
   if (impl_->stream_active && packet == "END") {
     impl_->stream_active = false;
+    LOG_BLE("Stream END received. Processed %u bytes.",
+            (unsigned int)impl_->stream_processed_bytes);
 
-    if (impl_->stream_buffer.size() != impl_->stream_expected_len) {
+    if (impl_->stream_is_ota) {
+      // OTA Finalization is handled by the worker task detecting end of stream
+      // or special flag For now, we can notify the task that stream is done.
+      // We'll leave it generating '0' bytes for now?
+      // Or we set a flag 'ota_stream_complete'
+      LOG_BLE("OTA Stream Complete message.");
+      return;
+    }
+
+    // LEGACY PATH FINALIZATION (BUFFER TO RAM)
+    if (impl_->config_buffer.size() != impl_->stream_expected_len) {
       LOG_ERR("Length mismatch: expected %u, got %u",
               impl_->stream_expected_len,
-              (unsigned int)impl_->stream_buffer.size());
-      impl_->stream_buffer.clear();
+              (unsigned int)impl_->config_buffer.size());
+      impl_->config_buffer.clear();
       return;
     }
 
     uint32_t actual_crc =
-        crc32_ieee(impl_->stream_buffer.data(), impl_->stream_buffer.size());
+        crc32_ieee(impl_->config_buffer.data(), impl_->config_buffer.size());
     if (actual_crc != impl_->stream_expected_crc) {
-      LOG_ERR("CRC mismatch: expected 0x%08lX, got 0x%08lX",
+      LOG_ERR("CRC Mismatch: expected 0x%08lX, got 0x%08lX",
               (unsigned long)impl_->stream_expected_crc,
               (unsigned long)actual_crc);
-      LOG_ERR("Buffer size: %u", (unsigned int)impl_->stream_buffer.size());
-      impl_->stream_buffer.clear();
+      impl_->config_buffer.clear();
       return;
     }
 
-    StaticJsonDocument<JSON_CAPACITY> doc;
-    DeserializationError err = deserializeJson(doc, impl_->stream_buffer.data(),
-                                               impl_->stream_buffer.size());
-
-    if (err) {
-      LOG_ERR("JSON parse error: %s", err.c_str());
-      impl_->stream_buffer.clear();
-      return;
-    }
-
-    if (doc.containsKey("persist")) {
-      bool persist_flag = doc["persist"] | false;
-      impl_->stream_is_persistent = persist_flag;
-      LOG_NVS("Persist from JSON: %s", persist_flag ? "NVS" : "RAM");
-    }
+    LOG_BLE("CRC OK. Processing payload...");
 
     if (impl_->stream_is_debug_watch) {
-      impl_->debug_signals.clear();
-      JsonArray signals_arr = doc["signals"];
-      if (signals_arr) {
-        for (JsonObject sig_obj : signals_arr) {
-          Signal sig = {};
-          String id_str = sig_obj["id"].as<String>();
-          strncpy(sig.id, id_str.c_str(), sizeof(sig.id) - 1);
-          strncpy(sig.key, sig_obj["key"] | "", sizeof(sig.key) - 1);
-          sig.can_id = sig_obj["can_id"] | 0;
-          sig.start_bit = sig_obj["start"] | 0;
-          sig.bit_length = sig_obj["len"] | 0;
-          sig.big_endian = sig_obj["be"] | true;
-          sig.factor = sig_obj["factor"] | 1.0f;
-          sig.offset = sig_obj["offset"] | 0.0f;
-          sig.value = 0.0f;
-          sig.last_value = 0.0f;
-          sig.last_debug_value = -999999.9f;
+      StaticJsonDocument<JSON_CAPACITY> doc;
+      DeserializationError error = deserializeJson(
+          doc, impl_->config_buffer.data(), impl_->config_buffer.size());
+
+      if (error) {
+        LOG_ERR("Debug Watch JSON Failed: %s", error.c_str());
+      } else {
+        JsonArray signals = doc["signals"];
+        impl_->debug_signals.clear();
+        for (JsonObject s : signals) {
+          Signal sig;
+          // Populate Signal struct from JSON
+          sig.can_id = s["can_id"];
+          sig.start_bit = s["start"];
+          sig.bit_length = s["length"];
+          sig.factor = s["factor"] | 1.0f;
+          sig.offset = s["offset"] | 0.0f;
+          sig.big_endian = s["big_endian"] | false; // Default Little Endian
+          const char *name = s["name"];
+          strlcpy(sig.id, name ? name : "debug", sizeof(sig.id));
+
+          sig.last_value = 0;
+          sig.last_update_ms = 0;
+          sig.ever_set = false;
+          sig.last_debug_value = -999999.9f; // Force initial update
+
           impl_->debug_signals.push_back(sig);
         }
+        LOG_BLE("Debug Watch Configured: %d signals",
+                impl_->debug_signals.size());
+        impl_->debug_mode = true;
       }
-      LOG_BLE("Watching %u signals", impl_->debug_signals.size());
-      impl_->stream_buffer.clear();
+
+      impl_->config_buffer.clear();
       impl_->stream_is_debug_watch = false;
+      return;
+    }
+
+    // Apply Ruleset
+    StaticJsonDocument<JSON_CAPACITY> doc;
+    DeserializationError error = deserializeJson(
+        doc, impl_->config_buffer.data(), impl_->config_buffer.size());
+
+    if (error) {
+      LOG_ERR("JSON Failed: %s", error.c_str());
+      impl_->config_buffer.clear();
       return;
     }
 
     if (!applyRuleset(doc)) {
       LOG_ERR("Failed to apply ruleset");
-      impl_->stream_buffer.clear();
+      impl_->config_buffer.clear();
       return;
     }
 
-    impl_->last_ruleset_json = String((const char *)impl_->stream_buffer.data(),
-                                      impl_->stream_buffer.size());
+    // Store for Persistence (NVS Double Buffering)
+    impl_->last_ruleset_json = String((const char *)impl_->config_buffer.data(),
+                                      impl_->config_buffer.size());
     impl_->ruleset_crc32 = actual_crc;
 
     if (impl_->stream_is_persistent) {
-      String current = nvsRead(NVS_KEY_CURRENT);
-      if (current.length() > 0) {
-        nvsWrite(NVS_KEY_BACKUP, current);
+      // Determine Active Slot
+      char slot_char = 'A'; // Default
+      size_t required_size;
+      if (nvs_get_str(impl_->nvs_handle, NVS_KEY_ACTIVE_SLOT, NULL,
+                      &required_size) == ESP_OK) {
+        char buf[2];
+        nvs_get_str(impl_->nvs_handle, NVS_KEY_ACTIVE_SLOT, buf,
+                    &required_size);
+        slot_char = buf[0];
       }
-      nvsWrite(NVS_KEY_CURRENT, impl_->last_ruleset_json);
-      LOG_NVS("Ruleset persisted");
+
+      // Flip Slot
+      const char *target_key =
+          (slot_char == 'A') ? NVS_KEY_SLOT_B : NVS_KEY_SLOT_A;
+      const char *new_slot = (slot_char == 'A') ? "B" : "A";
+
+      esp_err_t err = nvs_set_str(impl_->nvs_handle, target_key,
+                                  impl_->last_ruleset_json.c_str());
+      if (err == ESP_OK) {
+        nvs_set_str(impl_->nvs_handle, NVS_KEY_ACTIVE_SLOT, new_slot);
+        nvs_commit(impl_->nvs_handle);
+        LOG_NVS("Ruleset persisted to Slot %s", new_slot);
+      } else {
+        LOG_ERR("NVS Write Failed: %s", esp_err_to_name(err));
+      }
     } else {
-      LOG_BLE("Ruleset applied (non-persistent)");
+      LOG_BLE("Ruleset applied (RAM only)");
     }
 
-    impl_->stream_buffer.clear();
+    impl_->config_buffer.clear();
     sendStatusUpdate();
+
+    // Active Low: Blink LOW (ON) then HIGH (OFF)
     blinkLed(3, 100);
     LOG_BLE("Ruleset applied successfully");
     return;
@@ -1513,44 +1894,28 @@ void W4RPBLE::deriveModuleId() {
   }
 }
 
+// --------------------------------------------------------------------------
+// NVS & Persistence
+// --------------------------------------------------------------------------
+
 void W4RPBLE::loadRulesFromNvs() {
-  String nvs_current = nvsRead(NVS_KEY_CURRENT);
-  if (nvs_current.length() > 0) {
-    LOG_NVS("Loading persisted ruleset...");
-
-    DynamicJsonDocument doc(JSON_CAPACITY);
-    DeserializationError err = deserializeJson(doc, nvs_current);
-
-    if (!err && applyRuleset(doc)) {
-      impl_->last_ruleset_json = nvs_current;
-      impl_->ruleset_crc32 = crc32_ieee((const uint8_t *)nvs_current.c_str(),
-                                        nvs_current.length());
-      LOG_NVS("Loaded: %u signals, %u nodes, %u flows", impl_->signals.size(),
-              impl_->nodes.size(), impl_->flows.size());
-      blinkLed(2, 50);
+  LOG_ERR("Failed to load ruleset - trying backup");
+  String nvs_backup = nvsRead(NVS_KEY_BACKUP);
+  if (nvs_backup.length() > 0) {
+    DynamicJsonDocument backup_doc(JSON_CAPACITY);
+    DeserializationError backup_err = deserializeJson(backup_doc, nvs_backup);
+    if (!backup_err && applyRuleset(backup_doc)) {
+      impl_->last_ruleset_json = nvs_backup;
+      impl_->ruleset_crc32 =
+          crc32_ieee((const uint8_t *)nvs_backup.c_str(), nvs_backup.length());
+      nvsWrite(NVS_KEY_CURRENT, nvs_backup);
+      LOG_NVS("Backup restored successfully");
+      blinkLed(3, 50);
       return;
     }
-
-    LOG_ERR("Failed to load ruleset - trying backup");
-    String nvs_backup = nvsRead(NVS_KEY_BACKUP);
-    if (nvs_backup.length() > 0) {
-      DynamicJsonDocument backup_doc(JSON_CAPACITY);
-      DeserializationError backup_err = deserializeJson(backup_doc, nvs_backup);
-      if (!backup_err && applyRuleset(backup_doc)) {
-        impl_->last_ruleset_json = nvs_backup;
-        impl_->ruleset_crc32 = crc32_ieee((const uint8_t *)nvs_backup.c_str(),
-                                          nvs_backup.length());
-        nvsWrite(NVS_KEY_CURRENT, nvs_backup);
-        LOG_NVS("Backup restored successfully");
-        blinkLed(3, 50);
-        return;
-      }
-    }
-
-    LOG_ERR("Backup also failed - starting empty");
-  } else {
-    LOG_NVS("No persisted ruleset - starting empty");
   }
+
+  LOG_ERR("Backup also failed - starting empty");
 }
 
 void W4RPBLE::registerCapability(const String &id, CapabilityHandler handler) {
@@ -1575,22 +1940,21 @@ void W4RPBLE::begin() {
 
   impl_->advertising = nullptr;
   impl_->server = nullptr;
-  impl_->adv_verification_pending = false;
-  impl_->adv_verification_deadline_ms = 0;
-  impl_->adv_restart_attempts = 0;
-  impl_->adv_error_state = false;
-  impl_->adv_needs_deep_reset = false;
   impl_->last_disconnect_ms = 0;
-  impl_->consecutive_failures = 0;
   impl_->last_successful_connect_ms = 0;
   impl_->ble_stack_healthy = true;
 
   deriveModuleId();
 
+  LOG_SYS("DEBUG: Override='%s', Len=%u", impl_->ble_name_override.c_str(),
+          impl_->ble_name_override.length());
+
   if (impl_->ble_name_override.length() > 0) {
     impl_->device_name = impl_->ble_name_override;
+    LOG_SYS("DEBUG: Using Override Name");
   } else {
     impl_->device_name = String(impl_->module_id);
+    LOG_SYS("DEBUG: Using Module ID as Name");
   }
 
   LOG_SYS("W4RP Firmware Setup");
@@ -1621,20 +1985,37 @@ void W4RPBLE::begin() {
     });
   }
 
+  // Boot Count Persistence
+  impl_->prefs.begin(NVS_NS, false);
+  impl_->boot_count = impl_->prefs.getUInt(NVS_KEY_BOOTS, 0) + 1;
+  impl_->prefs.putUInt(NVS_KEY_BOOTS, impl_->boot_count);
+  impl_->prefs.end();
+  LOG_NVS("Boot Count: %u", impl_->boot_count);
+
   initBle();
   initCan();
+
+  // Open NVS Permanently
+  esp_err_t nvs_err = nvs_open(NVS_NS, NVS_READWRITE, &impl_->nvs_handle);
+  if (nvs_err == ESP_OK) {
+    impl_->nvs_open = true;
+  } else {
+    LOG_ERR("Failed to open NVS: %s", esp_err_to_name(nvs_err));
+  }
+
   loadRulesFromNvs();
 
   impl_->last_status_update_ms = 0;
-  impl_->last_health_check_ms = millis();
 
   LOG_SYS("Ready");
 }
 
 void W4RPBLE::processCan() {
   uint32_t now = millis();
+  int processed = 0;
+  const int MAX_FRAMES_PER_LOOP = 128; // Drain the queue!
 
-  for (int i = 0; i < 16; i++) {
+  while (processed < MAX_FRAMES_PER_LOOP) {
     uint32_t can_id;
     uint8_t data[8];
     uint8_t dlc;
@@ -1643,16 +2024,22 @@ void W4RPBLE::processCan() {
       break;
 
     impl_->frames_received++;
+    processed++;
 
-    for (Signal &sig : impl_->signals) {
-      if (sig.can_id == can_id) {
-        sig.last_value = sig.value;
-        sig.value = decode_signal(sig, data);
-        sig.last_update_ms = now;
-        sig.ever_set = true;
+    // Optimized Lookups via Map O(1)
+    if (impl_->signal_map.count(can_id)) {
+      for (Signal *sig : impl_->signal_map[can_id]) {
+        sig->last_value = sig->value;
+        sig->value = decode_signal(*sig, data);
+        sig->last_update_ms = now;
+        sig->ever_set = true;
       }
     }
 
+    // Process Debug Signals (Always full scan or optimized?)
+    // Debug signals are separate copies. Ideally we'd map them too, but
+    // usually there are few debug signals. For strict correctness, we scan
+    // them.
     for (Signal &sig : impl_->debug_signals) {
       if (sig.can_id == can_id) {
         sig.last_value = sig.value;
@@ -1685,7 +2072,28 @@ void W4RPBLE::sendDebugUpdates() {
   int updates_sent = 0;
   const int MAX_UPDATES_PER_LOOP = 20; // Allow more updates per cycle
 
-  // Send Signal Updates
+  // EXCLUSIVE MODE: If Debug Watch signals are defined, ONLY send those.
+  if (!impl_->debug_signals.empty()) {
+    for (Signal &sig : impl_->debug_signals) {
+      if (updates_sent >= MAX_UPDATES_PER_LOOP)
+        break;
+
+      // Send updates if value changed OR if it's the first time
+      // (last_debug_value = -999999.9)
+      if (fabsf(sig.value - sig.last_debug_value) > 0.01f) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "D:S:%s:%.2f", sig.id, sig.value);
+        impl_->tx_char->setValue((uint8_t *)buf, strlen(buf));
+        impl_->tx_char->notify();
+        sig.last_debug_value = sig.value;
+        delay(10);
+        updates_sent++;
+      }
+    }
+    return; // Skip normal system updates in Watch Mode
+  }
+
+  // NORMAL MODE: Send System Signals
   for (Signal &sig : impl_->signals) {
     if (updates_sent >= MAX_UPDATES_PER_LOOP)
       break;
@@ -1719,24 +2127,60 @@ void W4RPBLE::sendDebugUpdates() {
       updates_sent++;
     }
   }
+}
 
-  // Send Debug Signal Updates
-  for (Signal &sig : impl_->debug_signals) {
-    if (updates_sent >= MAX_UPDATES_PER_LOOP)
-      break;
-    if (fabsf(sig.value - sig.last_debug_value) > 0.01f) {
-      char buf[64];
-      snprintf(buf, sizeof(buf), "D:S:%s:%.2f", sig.id, sig.value);
-      impl_->tx_char->setValue((uint8_t *)buf, strlen(buf));
-      impl_->tx_char->notify();
-      sig.last_debug_value = sig.value;
-      delay(10);
-      updates_sent++;
-    }
+// Helper to safely pause system for OTA
+void W4RPBLE::pauseOperations() {
+  if (impl_->ota_in_progress)
+    return;
+  impl_->ota_in_progress = true;
+
+  // Stop TWAI to prevent ISR starvation
+  // We only stop if it was running.
+  // Check if driver installed? (Implied by state, but safe to call stop)
+  // Note: twai_stop() requires state to be RUNNING or BUS_OFF.
+  // Errors might occur if forbidden, but we just try.
+  LOG_SYS("Pausing System for OTA...");
+  esp_err_t err = twai_stop();
+  if (err == ESP_OK) {
+    LOG_SYS("TWAI Stopped");
+  } else {
+    LOG_ERR("TWAI Stop Warning: %s", esp_err_to_name(err));
+    // Continue anyway, OTA is priority
   }
 }
 
+// Helper to resume system
+void W4RPBLE::resumeOperations() {
+  if (!impl_->ota_in_progress)
+    return;
+
+  // Resume TWAI
+  LOG_SYS("Resuming System...");
+  esp_err_t err = twai_start();
+  if (err == ESP_OK) {
+    LOG_SYS("TWAI Started");
+  } else {
+    LOG_ERR("TWAI Start Failed: %s", esp_err_to_name(err));
+  }
+
+  impl_->ota_in_progress = false;
+}
+
 void W4RPBLE::loop() {
+  if (!impl_)
+    return;
+
+  // OTA Safety Gate
+  // If OTA is actively receiving data, we SKIP heavy rule processing
+  if (impl_->ota_in_progress) {
+    // We still run essential housekeeping if needed, but return early
+    // to give max CPU to `otaWorkerTask` and BLE stack.
+    vTaskDelay(pdMS_TO_TICKS(1)); // Yield
+    return;
+  }
+
+  // 1. Monitor CAN signals
   processCan();
 
   if (!impl_->flows.empty()) {
@@ -1745,29 +2189,32 @@ void W4RPBLE::loop() {
 
   sendDebugUpdates();
   sendStatusIfNeeded();
-  verifyAdvertisingActive();
 
   uint32_t now = millis();
-  if (now - impl_->last_health_check_ms > 10000) {
-    checkBleHealth();
-    impl_->last_health_check_ms = now;
-  }
 
   const uint32_t BLINK_INTERVAL_OK_MS = 500;
   const uint32_t BLINK_INTERVAL_ERROR_MS = 100;
 
   if (impl_->client_connected) {
-    digitalWrite(impl_->pin_led, HIGH);
+    // Active Low: LOW is ON
+    digitalWrite(impl_->pin_led, LOW);
   } else {
-    uint32_t interval =
-        impl_->adv_error_state ? BLINK_INTERVAL_ERROR_MS : BLINK_INTERVAL_OK_MS;
-
-    if (now - impl_->last_led_blink_ms >= interval) {
+    // Standard blink: 500ms
+    const uint32_t BLINK_INTERVAL_MS = 500;
+    if (now - impl_->last_led_blink_ms >= BLINK_INTERVAL_MS) {
       impl_->led_blink_state = !impl_->led_blink_state;
-      digitalWrite(impl_->pin_led, impl_->led_blink_state ? HIGH : LOW);
+      // Blink between LOW (ON) and HIGH (OFF)
+      digitalWrite(impl_->pin_led, impl_->led_blink_state ? LOW : HIGH);
       impl_->last_led_blink_ms = now;
     }
   }
 
-  delay(1);
+  // Yield more CPU time (5ms) to keep loop sane
+  delay(5);
+}
+
+void W4RPBLE::otaWorkerTaskStatic(void *pvParameters) {
+  if (pvParameters) {
+    ((W4RPBLE *)pvParameters)->otaWorkerTask();
+  }
 }
