@@ -1,7 +1,7 @@
 # W4RPBLE: Automotive automation modules for ESP32
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.1.0-green.svg)]()
+[![Version](https://img.shields.io/badge/version-1.2.0-purple.svg)]()
 
 W4RPBLE is a specialized C++ library designed to transform Espressif ESP32 microcontrollers into high-performance automotive modules. It functions as a bidirectional bridge between a vehicle's Controller Area Network (CAN) bus and a mobile device via Bluetooth Low Energy (BLE).
 
