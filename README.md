@@ -12,7 +12,6 @@ Read vehicle signals • Trigger custom actions • OTA updates via BLE
   <a href="#examples">Examples</a>
 </p>
 
----
 
 ## Quick Start
 
@@ -190,6 +189,10 @@ Coming soon.
 - ESP32 / ESP32-C3 / ESP32-S3
 - Arduino IDE 1.8+ or PlatformIO
 - ESP32 Arduino Core 2.0+
+
+### For Delta OTA (optional)
+
+- [janpatch](https://github.com/janjongboom/janpatch) — Download `janpatch.h` to project folder
 
 ## Contributing
 

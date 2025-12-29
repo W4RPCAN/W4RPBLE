@@ -7,3 +7,4 @@ readme-*.md
 /test
 /deprecated
 W4RP-BLE.ino
+janpatch.h
