@@ -1,16 +1,35 @@
 #######################################
-# Syntax Coloring Map for W4RPBLE
+# Syntax Coloring Map for W4RP
 #######################################
 
 #######################################
 # Datatypes (KEYWORD1)
 #######################################
 
-W4RPBLE	KEYWORD1
+Controller	KEYWORD1
+Engine	KEYWORD1
+CAN	KEYWORD1
+Storage	KEYWORD1
+Communication	KEYWORD1
+OTA	KEYWORD1
+TWAICanBus	KEYWORD1
+NVSStorage	KEYWORD1
+BLETransport	KEYWORD1
+ESP32OTAService	KEYWORD1
 CapabilityMeta	KEYWORD1
 CapabilityParamMeta	KEYWORD1
+CapabilityHandler	KEYWORD1
 ParamMap	KEYWORD1
-CanMode	KEYWORD1
+CanFrame	KEYWORD1
+RuntimeSignal	KEYWORD1
+RuntimeCondition	KEYWORD1
+RuntimeAction	KEYWORD1
+RuntimeRule	KEYWORD1
+OTAStatus	KEYWORD1
+OTAProgress	KEYWORD1
+BusStatus	KEYWORD1
+Operation	KEYWORD1
+ParamType	KEYWORD1
 
 #######################################
 # Methods and Functions (KEYWORD2)
@@ -18,25 +37,66 @@ CanMode	KEYWORD1
 
 begin	KEYWORD2
 loop	KEYWORD2
+setModuleInfo	KEYWORD2
+setLedPin	KEYWORD2
 getModuleId	KEYWORD2
-getFwVersion	KEYWORD2
-setModuleHardware	KEYWORD2
-setModuleFirmware	KEYWORD2
-setModuleSerial	KEYWORD2
-setModuleIdOverride	KEYWORD2
-setBleName	KEYWORD2
-setPins	KEYWORD2
-setCanTiming	KEYWORD2
-setCanMode	KEYWORD2
+getUptime	KEYWORD2
+getBootCount	KEYWORD2
+getRulesMode	KEYWORD2
+getEngine	KEYWORD2
+isConnected	KEYWORD2
 registerCapability	KEYWORD2
-nvsWrite	KEYWORD2
-nvsRead	KEYWORD2
-applyRuleset	KEYWORD2
+loadRuleset	KEYWORD2
+clearRuleset	KEYWORD2
+processCanFrame	KEYWORD2
+evaluateRules	KEYWORD2
+loadDebugSignals	KEYWORD2
+clearDebugSignals	KEYWORD2
+setDebugMode	KEYWORD2
+isDebugMode	KEYWORD2
+getSignalCount	KEYWORD2
+getConditionCount	KEYWORD2
+getActionCount	KEYWORD2
+getRuleCount	KEYWORD2
+getRulesTriggered	KEYWORD2
+getRulesetBinary	KEYWORD2
+getRulesetCRC	KEYWORD2
+getCapabilities	KEYWORD2
+getUnknownCapability	KEYWORD2
+receive	KEYWORD2
+transmit	KEYWORD2
+stop	KEYWORD2
+resume	KEYWORD2
+isRunning	KEYWORD2
+getStatus	KEYWORD2
+getErrorCount	KEYWORD2
+recover	KEYWORD2
+writeBlob	KEYWORD2
+readBlob	KEYWORD2
+writeString	KEYWORD2
+readString	KEYWORD2
+erase	KEYWORD2
+commit	KEYWORD2
+send	KEYWORD2
+sendStatus	KEYWORD2
+onReceive	KEYWORD2
+onConnectionChange	KEYWORD2
+getMTU	KEYWORD2
+abort	KEYWORD2
+startFirmwareUpdate	KEYWORD2
+writeFirmwareChunk	KEYWORD2
+finalizeFirmwareUpdate	KEYWORD2
+startDeltaUpdate	KEYWORD2
+writeDeltaChunk	KEYWORD2
+finalizeDeltaUpdate	KEYWORD2
+setProgressCallback	KEYWORD2
+setCompleteCallback	KEYWORD2
+needsPause	KEYWORD2
 
 #######################################
 # Constants (LITERAL1)
 #######################################
 
-NORMAL	LITERAL1
-LISTEN_ONLY	LITERAL1
-NO_ACK	LITERAL1
+TWAI_MODE_NORMAL	LITERAL1
+TWAI_MODE_LISTEN_ONLY	LITERAL1
+TWAI_MODE_NO_ACK	LITERAL1
