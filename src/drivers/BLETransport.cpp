@@ -35,19 +35,19 @@ bool BLETransport::begin(const char *deviceName) {
 
   // RX Characteristic (Write from client)
   rxChar_ = service_->createCharacteristic(
-      W4RP_CHAR_RX_UUID,
+      W4RP_RX_UUID,
       BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR);
   rxChar_->setCallbacks(this);
 
   // TX Characteristic (Notify to client)
   txChar_ = service_->createCharacteristic(
-      W4RP_CHAR_TX_UUID,
+      W4RP_TX_UUID,
       BLECharacteristic::PROPERTY_NOTIFY | BLECharacteristic::PROPERTY_READ);
   txChar_->addDescriptor(new BLE2902());
 
   // Status Characteristic (Notify to client)
   statusChar_ = service_->createCharacteristic(
-      W4RP_CHAR_STATUS_UUID,
+      W4RP_STATUS_UUID,
       BLECharacteristic::PROPERTY_NOTIFY | BLECharacteristic::PROPERTY_READ);
   statusChar_->addDescriptor(new BLE2902());
 
